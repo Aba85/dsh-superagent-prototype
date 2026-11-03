@@ -45,6 +45,9 @@ export interface PullRef { number: number; isPr: boolean; url?: string; prAuthor
  */
 export const isHumanLogin = (user: { login: string; type?: string }): boolean =>
   !/\[bot\]$/.test(user.login) && (!user.type || user.type === 'User')
+/** DSH outbound comments carry this marker so the shared GitHub account cannot echo its own replies back as work. */
+export const isDshOutboundComment = (body: string | null | undefined): boolean =>
+  /<!-- dsh-superagent:[^>\r\n]+ -->/.test(body ?? '')
 /** Formats an inline review comment's file:line and the trailing lines of its diff hunk, which GitHub ends at the commented line. */
 export function reviewPlace(comment: GithubComment): string {
   const line = comment.line ?? comment.original_line
@@ -59,16 +62,17 @@ function commentText(comment: GithubComment, kind: 'conversation' | 'inline' | '
 }
 export const mentions = (text: string, login: string): boolean =>
   new RegExp(`(?:^|[^a-zA-Z0-9_@])@${escapeRegExp(login)}(?![a-zA-Z0-9_-])`, 'i').test(text)
-const author = (user: { login: string; type?: string }, agent: string) =>
-  ({ actor: { source: SOURCE, id: user.login }, human: isHumanLogin(user) && !sameName(user.login, agent) })
+const author = (user: { login: string; type?: string }, agent: string, allowSharedAccount = false) =>
+  ({ actor: { source: SOURCE, id: user.login }, human: isHumanLogin(user) && (allowSharedAccount || !sameName(user.login, agent)) })
 /** Builds a trigger for a comment or review; text is empty for a bodyless comment or a `COMMENTED` review without a body. */
 export function commentTrigger(comment: GithubComment, ref: PullRef, kind: 'conversation' | 'inline' | 'review', agent: string): Trigger {
   const at = comment.updated_at ?? comment.submitted_at ?? comment.created_at ?? new Date().toISOString()
   const version = comment.updated_at ?? comment.submitted_at ?? ''
   const id = key('github-comment', comment.html_url ?? `github:${ref.number}`, String(comment.id), version)
-  return { id, source: SOURCE, threads: [{ source: SOURCE, id: String(ref.number) }], ...author(comment.user, agent), at,
+  const addressed = mentions(comment.body ?? '', agent)
+  return { id, source: SOURCE, threads: [{ source: SOURCE, id: String(ref.number) }], ...author(comment.user, agent, addressed), at,
     text: commentText(comment, kind),
-    ...(mentions(comment.body ?? '', agent) ? { addressed: 'mention' as const } : {}),
+    ...(addressed ? { addressed: 'mention' as const } : {}),
     channel: githubChannel(ref.number, comment.html_url ?? undefined),
     ...(comment.html_url ?? ref.url ? { url: comment.html_url ?? ref.url } : {}),
     meta: { number: ref.number, isPr: ref.isPr, ...(ref.prAuthor ? { prAuthor: ref.prAuthor } : {}), commentId: comment.id, kind,

@@ -336,10 +336,12 @@ describe('github source', () => {
     expect(review({ state: 'APPROVED', commit_id: 'abc123' })).toBe('APPROVED review of commit abc123')
     expect(review({ state: 'CHANGES_REQUESTED', commit_id: 'abc123', body: 'Keep the margin' })).toBe('CHANGES_REQUESTED review of commit abc123\n\nKeep the margin')
     expect(review({ state: 'COMMENTED', commit_id: 'abc123' })).toBe('')
-    // A mention of the agent addresses it, whatever the case; the agent's own messages are automated.
+    // The shared account is a human instruction only when it explicitly addresses the agent.
     expect(commentTrigger({ id: 9, body: '@Agent-Bot please fix', user: { login: 'alice', type: 'User' } }, { number: 7, isPr: true }, 'conversation', 'agent-bot')).toMatchObject({ human: true, addressed: 'mention' })
     expect(commentTrigger({ id: 10, body: 'mail@agent-bot.example', user: { login: 'alice', type: 'User' } }, { number: 7, isPr: true }, 'conversation', 'agent-bot')).not.toHaveProperty('addressed')
-    expect(commentTrigger({ id: 11, body: 'pushed', user: { login: 'Agent-Bot', type: 'User' } }, { number: 7, isPr: true }, 'conversation', 'agent-bot').human).toBe(false)
+    expect(commentTrigger({ id: 11, body: 'owner note', user: { login: 'Agent-Bot', type: 'User' } }, { number: 7, isPr: true }, 'conversation', 'agent-bot').human).toBe(false)
+    expect(commentTrigger({ id: 12, body: '@agent-bot authorized order', user: { login: 'Agent-Bot', type: 'User' } }, { number: 7, isPr: true }, 'conversation', 'agent-bot'))
+      .toMatchObject({ human: true, addressed: 'mention' })
   })
   it('reads the address of an Issue, a PR or a review comment of the repository, and nothing else', () => {
     expect(githubAddress('https://api.github.com/repos/acme/widgets/pulls/9', 'acme/widgets')).toEqual({ number: 9, pr: true })
@@ -484,7 +486,7 @@ describe('github source', () => {
     h.store.threads.save(thread)
     const comment = (id: number, login: string, at: string, body: string) => ({ id, body, user: { login }, created_at: at, updated_at: at })
     github(h, { 'issues/7': { ...issue(7, { title: 'Fix the margin' }), pull_request: { url: 'x' } }, 'pulls/7': openPull(7),
-      'issues/7/comments': [comment(1, 'agent-bot', '2026-09-01T01:00:00Z', 'mine'), comment(2, 'a', '2026-08-01T00:00:00Z', 'old'),
+      'issues/7/comments': [comment(1, 'agent-bot', '2026-09-01T01:00:00Z', 'mine\n\n<!-- dsh-superagent:outbound-reply -->'), comment(2, 'a', '2026-08-01T00:00:00Z', 'old'),
         comment(3, 'b', '2026-09-01T02:00:00Z', 'new')] })
     await pollGithubThreads(h)
     expect(h.receive).toHaveBeenCalledTimes(1)
@@ -1024,7 +1026,7 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(pollFailure(2, 3, eof)).toBeUndefined()
   expect(pollFailure(3, 3, eof)).toEqual({ state: 'error', detail: '3 consecutive failed polls; last: Error: Get "https://api.github.com/x": EOF', code: 'pollFailures', values: { count: '3', error: 'Error: Get "https://api.github.com/x": EOF' } })
   expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
-    observePulls: false, observeComments: false, observeCi: false })
+    observePulls: false, observeComments: false, observeIssueComments: [], observeCi: false })
 })
 describe('feishu event consumer', () => {
   let dir: string
@@ -1191,10 +1193,10 @@ describe('observing the GitHub repository', () => {
   const issue = (number: number, fields: Partial<GithubIssue> = {}): GithubIssue => ({ id: 1000 + number, number, title: `Issue ${number}`,
     body: 'details', state: 'open', created_at: at(0), updated_at: at(0),
     html_url: `https://github.com/acme/widgets/issues/${number}`, user: { login: 'carol', type: 'User' }, ...fields })
-  const observe = (h: ReturnType<typeof host>, config: Record<string, boolean>) =>
+  const observe = (h: ReturnType<typeof host>, config: Record<string, unknown>) =>
     h.store.saveSettings({ ...h.store.settings(), sources: { ...h.store.settings().sources, github: { enabled: true, config } } })
   /** GitHub as the repository's lists and its default branch answer; a request with the ETag of an unchanged list answers 304. */
-  function repository(h: ReturnType<typeof host>, answers: { issues?: unknown[]; comments?: unknown[]; reviewComments?: unknown[];
+  function repository(h: ReturnType<typeof host>, answers: { issues?: unknown[]; comments?: unknown[]; issueComments?: Record<number, unknown[]>; reviewComments?: unknown[];
     branch?: { sha: string; checks: unknown[] } }) {
     const calls: string[][] = []
     vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
@@ -1205,6 +1207,8 @@ describe('observing the GitHub repository', () => {
       if (args.includes('If-None-Match: "same"')) throw commandError({ stderr: 'gh: HTTP 304', code: 1 })
       if (bare === 'issues') return listed(answers.issues)
       if (bare === 'issues/comments') return listed(answers.comments)
+      const issueComments = /^issues\/(\d+)\/comments$/.exec(bare)
+      if (issueComments) return listed(answers.issueComments?.[Number(issueComments[1])])
       if (bare === 'pulls/comments') return listed(answers.reviewComments)
       if (bare === '') return JSON.stringify({ default_branch: 'main' })
       if (bare === 'commits/main') return JSON.stringify({ sha: answers.branch!.sha })
@@ -1264,6 +1268,35 @@ describe('observing the GitHub repository', () => {
     await pollRound(h)
     expect(h.receive.mock.calls.map(([trigger]) => [trigger.meta.number, trigger.meta.isPr, trigger.meta.kind, trigger.human]))
       .toEqual([[7, false, 'conversation', true], [9, true, 'conversation', false], [9, true, 'inline', true]])
+    h.store.close()
+  })
+  it('reads selected Issue comments from the shared account and drops DSH outbound echoes', async () => {
+    const h = host()
+    const agentLogin = h.deployment.github.login
+    observe(h, { observeIssueComments: [{ number: '541' }], observeIssues: true, observePulls: true, observeComments: true, observeCi: true })
+    h.store.set('github-since', at(-24))
+    h.store.set('github-stream:issue-comments:541', { since: at(0), started: { comments: at(0) } })
+    const comment = (id: number, number: number, login: string, body: string, repository = 'acme/widgets', htmlRepository = 'acme/widgets') => ({ id, body, user: { login, type: 'User' },
+      issue_url: `https://api.github.com/repos/${repository}/issues/${number}`,
+      html_url: `https://github.com/${htmlRepository}/issues/${number}#issuecomment-${id}`, created_at: at(1), updated_at: at(1) })
+    const calls = repository(h, { issueComments: { 541: [
+      comment(1, 541, agentLogin, `@${agentLogin} authorized owner order`),
+      comment(2, 541, agentLogin, 'DSH acknowledgement\n\n<!-- dsh-superagent:outbound-ack -->'),
+      comment(3, 542, agentLogin, `@${agentLogin} forged issue number`),
+      comment(4, 541, agentLogin, `@${agentLogin} foreign repository`, 'attacker/other-repo'),
+      comment(5, 541, agentLogin, `@${agentLogin} forged link`, 'acme/widgets', 'attacker/other-repo'),
+    ] } })
+    for (const stream of ['issues', 'comments', 'review-comments', 'issue-comments:542']) h.store.set(`github-stream:${stream}`, { since: at(0), started: { comments: at(0) } })
+    await pollRound(h)
+    expect(h.receive).toHaveBeenCalledTimes(1)
+    expect(calls.map(args => args[1]!.replace(/^repos\/acme\/widgets\//, '').split('?')[0])).toEqual(['issues/541/comments'])
+    expect(h.store.get('github-stream:issues')).toBeUndefined()
+    expect(h.store.get('github-stream:comments')).toBeUndefined()
+    expect(h.store.get('github-stream:review-comments')).toBeUndefined()
+    expect(h.store.get('github-stream:issue-comments:542')).toBeUndefined()
+    expect(h.receive.mock.calls[0]![0]).toMatchObject({ actor: { id: agentLogin }, human: true, addressed: 'mention',
+      text: `@${agentLogin} authorized owner order`, meta: { number: 541, kind: 'conversation' } })
+    expect(githubKind.schema.parse({ observeIssueComments: [{ number: '541' }] }).observeIssueComments).toEqual([{ number: '541' }])
     h.store.close()
   })
   it('fails the round for a stream whose read fails, keeps its cursor, and still reads the other streams', async () => {

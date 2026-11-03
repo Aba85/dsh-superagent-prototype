@@ -482,5 +482,13 @@ describe('bots and events without a sender', () => {
       ['pulls', { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false }],
       ['comments', { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false }],
       ['ci', { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: false }]])
+    const selected = setup(observing({ observeComments: true, observeIssueComments: [{ number: '541' }] }))
+    expect(selected.sources.scope(github({ kind: 'conversation', number: 541 })))
+      .toEqual({ listened: true, observed: true, row: 'comments' })
+    expect(selected.sources.scope(github({ kind: 'conversation', number: 542 })))
+      .toEqual({ listened: true, observed: false, row: 'comments' })
+    const selectedComments = githubKind.policy!.rows!({ observeComments: true, observeIssueComments: [{ number: '541' }] }).find(row => row.id === 'comments')!
+    expect(selectedComments.note.en).toBe('Issues #541')
+    expect(selectedComments.cells).toEqual({ listedUnaddressed: true, unlistedAddressed: true, unlistedUnaddressed: true })
   })
 })
