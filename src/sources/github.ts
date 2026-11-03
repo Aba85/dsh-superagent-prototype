@@ -5,7 +5,7 @@ import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
 import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
-import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
+import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, isDshOutboundComment, issueTrigger, IssueSchema, pullTrigger, SOURCE }
   from './github-trigger.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
@@ -25,6 +25,7 @@ const NotificationSchema = z.looseObject({
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
+  observeIssueComments: z.array(z.object({ number: z.string().regex(/^[1-9]\d*$/) }).strict()).max(20).default([]),
   observeCi: z.boolean().default(false) }).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
 const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
@@ -35,6 +36,7 @@ function scopeOf(meta: Record<string, unknown>): Scope | undefined {
   if (meta.kind === 'pull') return 'pulls'
   return meta.kind === 'conversation' || meta.kind === 'inline' || meta.kind === 'review' ? 'comments' : undefined
 }
+const selectedIssueOnly = (config: GithubConfig): boolean => config.observeIssueComments.length > 0
 export const githubKind: SourceKind<GithubConfig> = {
   kind: SOURCE,
   title: { zh: 'GitHub', en: 'GitHub' },
@@ -52,13 +54,21 @@ export const githubKind: SourceKind<GithubConfig> = {
     { key: 'observePulls', type: 'switch', label: { zh: '接收仓库里的新 PR', en: 'Receive new pull requests in the repository' },
       hint: { zh: '打开后，没有 @ 智能体的新 PR 也会收到，由策略的接收表决定是否成为候选。', en: 'New pull requests that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'observeComments', type: 'switch', label: { zh: '接收仓库里的评论', en: 'Receive comments in the repository' },
-      hint: { zh: '打开后，Issue 和 PR 上没有 @ 智能体的评论和代码评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments and review comments on Issues and PRs that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
+      hint: { zh: '接收所有 Issue/PR 评论；如“指定 Issue”列表不为空，则只读取列表内的 Issue 评论。', en: 'Receives all Issue/PR comments; when the selected Issue list is non-empty, only comments on those Issues are read.' } },
+    { key: 'observeIssueComments', type: 'rows', label: { zh: '接收指定 Issue 的评论', en: 'Receive comments on selected Issues' },
+      hint: { zh: '选择 Issue 后，只读取它们的讨论评论；全仓库评论开关不扩大这个范围。', en: 'When any Issues are selected, only their conversation comments are read; the repository-wide comments switch does not widen this scope.' },
+      columns: [{ key: 'number', type: 'text', pattern: '[1-9][0-9]*', label: { zh: 'Issue #', en: 'Issue #' } }] },
     { key: 'observeCi', type: 'switch', label: { zh: '接收默认分支的 CI', en: 'Receive the default branch\'s CI' },
       hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } }],
   // What the Source observes across the repository it receives in full; elsewhere, only what addresses the agent.
   scope: ({ meta }, config) => {
     const row = scopeOf(meta)
-    return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {} }
+    const observed = row === 'comments'
+      ? selectedIssueOnly(config)
+        ? typeof meta.number === 'number' && config.observeIssueComments.some(item => item.number === String(meta.number))
+        : config.observeComments
+      : row !== undefined && config[OBSERVED[row]]
+    return { listened: true, observed, ...row ? { row } : {} }
   },
   health: ['github'],
   channel: { send: sendGithub, link: githubLink },
@@ -82,8 +92,14 @@ export const githubKind: SourceKind<GithubConfig> = {
       const note = (observed: boolean | undefined) => observed ? { zh: '全部', en: 'All' } : { zh: '仅 @', en: '@ only' }
       const row = (id: Scope, label: { zh: string; en: string }) => ({ id, label, note: note(config[OBSERVED[id]]),
         cells: { listedUnaddressed: !!config[OBSERVED[id]], unlistedAddressed: true, unlistedUnaddressed: !!config[OBSERVED[id]] } })
+      const comments = row('comments', { zh: '评论', en: 'Comments' })
+      if (config.observeIssueComments?.length) {
+        const numbers = config.observeIssueComments.map(item => item.number)
+        comments.note = { zh: `Issue #${numbers.join(', #')}`, en: `Issues #${numbers.join(', #')}` }
+        comments.cells = { listedUnaddressed: true, unlistedAddressed: true, unlistedUnaddressed: true }
+      }
       return [row('issues', { zh: '新 Issue', en: 'New Issues' }), row('pulls', { zh: '新 PR', en: 'New pull requests' }),
-        row('comments', { zh: '评论', en: 'Comments' }),
+        comments,
         // CI has no sender, so only the cell of a sender off the list who does not address the agent applies.
         { id: 'ci', label: { zh: '默认分支的 CI', en: 'Default branch CI' }, note: config.observeCi ? { zh: '接收', en: 'Received' } : { zh: '不接收', en: 'Not received' },
           cells: { listedUnaddressed: false, unlistedAddressed: false, unlistedUnaddressed: !!config.observeCi } }]
@@ -179,6 +195,20 @@ const STREAMS = [
 async function pollRepository(ctx: SourceContext, round: Round): Promise<void> {
   const config = ctx.config<GithubConfig>(SOURCE)
   if (!config) return
+  if (selectedIssueOnly(config)) {
+    const selected = new Set(config.observeIssueComments.map(issue => issue.number))
+    for (const name of ctx.state.keys(KV.github.stream)) {
+      const match = /^github-stream:issue-comments:(\d+)$/.exec(name)
+      if (match && !selected.has(match[1]!)) ctx.state.set(name, undefined)
+      else if (!match) ctx.state.set(name, undefined)
+    }
+    for (const number of selected) {
+      if (stopped(ctx, round)) return
+      try { await readStream(ctx, round, `issue-comments:${number}`, `issues/${number}/comments?`, config) }
+      catch (error) { if (!stopped(ctx, round)) round.failures.push(`issue #${number} comments: ${String(error)}`) }
+    }
+    return
+  }
   for (const stream of STREAMS) {
     if (stopped(ctx, round)) return
     if (!stream.observed(config)) { ctx.state.set(KV.github.stream(stream.id), undefined); continue }
@@ -224,8 +254,8 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
   for (const item of items) {
     // Stopping mid-stream aborts before advancing the cursor so unread items are retried.
     if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
-    if (sameName(item.user.login, login)) continue
     if (id === 'issues') {
+      if (sameName(item.user.login, login)) continue
       const issue = IssueSchema.safeParse(item)
       const pr = issue.success && !!issue.data.pull_request
       if (!issue.success || !fresh(issue.data.created_at, pr ? 'pulls' : 'issues')) continue
@@ -233,11 +263,16 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
       nameThread(ctx, issue.data.number, issue.data.title)
       continue
     }
-    const number = Number(/\/(?:issues|pulls)\/(\d+)$/.exec((id === 'comments' ? item.issue_url : item.pull_request_url) ?? '')?.[1])
-    if (!number || !fresh(item.updated_at ?? item.created_at, 'comments')) continue
-    const isPr = id === 'review-comments' || /\/pull\//.test(item.html_url ?? '')
-    const ref = { number, isPr, ...item.html_url ? { url: item.html_url } : {} }
-    const trigger = commentTrigger(item, ref, id === 'comments' ? 'conversation' : 'inline', login)
+    const issueComments = /^issue-comments:(\d+)$/.exec(id)
+    const address = githubAddress((id === 'review-comments' ? item.pull_request_url : item.issue_url) ?? '', ctx.deployment.repository)
+    if (!address || !fresh(item.updated_at ?? item.created_at, 'comments')) continue
+    const { number } = address
+    if (issueComments && number !== Number(issueComments[1])) continue
+    if (sameName(item.user.login, login) && isDshOutboundComment(item.body)) continue
+    const commentAddress = githubAddress(item.html_url ?? '', ctx.deployment.repository)
+    if (!commentAddress || commentAddress.number !== number || id === 'review-comments' && !commentAddress.pr || issueComments && commentAddress.pr) continue
+    const ref = { number, isPr: commentAddress.pr, ...item.html_url ? { url: item.html_url } : {} }
+    const trigger = commentTrigger(item, ref, id === 'review-comments' ? 'inline' : 'conversation', login)
     if (trigger.text) await ctx.receive(trigger)
   }
   const newest = Math.max(...items.map(item => Date.parse(item.updated_at ?? '')).filter(Number.isFinite))
@@ -279,10 +314,15 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
  */
 export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promise<number> {
   const round = newRound(signal)
-  const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
+  const config = ctx.config<GithubConfig>(SOURCE)
+  const issueOnly = !!config && selectedIssueOnly(config)
+  const notified = issueOnly ? { value: { count: 0, interval: config.pollSeconds } }
+    : await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
   await pollRepository(ctx, round)
-  await pollTicketPulls(ctx, signal, round)
-  await pollThreads(ctx, signal, round)
+  if (!issueOnly) {
+    await pollTicketPulls(ctx, signal, round)
+    await pollThreads(ctx, signal, round)
+  }
   if ('error' in notified) throw notified.error
   const { count, interval } = notified.value
   if (signal?.aborted) return interval
@@ -394,7 +434,7 @@ async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, r
       if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
       const timestamp = Date.parse(comment.updated_at ?? comment.submitted_at ?? comment.created_at ?? '')
       if (!Number.isFinite(timestamp) || timestamp < Date.parse(since)) continue
-      if (sameName(comment.user.login, login)) continue
+      if (sameName(comment.user.login, login) && isDshOutboundComment(comment.body)) continue
       // A review decision without a body still reaches the ticket: a worker may be waiting for that approval.
       const trigger = commentTrigger(comment, ref, kind, login)
       if (trigger.text) await ctx.receive(trigger)
